@@ -172,13 +172,20 @@ bool tajima_open_file(vfs_file_t* file, embroidery_t* api)
     char meta[20];
     float value;
     uint_fast8_t idx;
-
     read_meta(buf, file); // Name
 
     while (read_meta(meta, file)) {
 
         idx = 3;
         strcaps(meta);
+
+        if (!strncmp(meta, "PD:", 3)) {
+            break; 
+        }
+
+        if (!strncmp(meta, "   ", 3)) {
+            break; 
+        }
 
         if (read_float(meta, &idx, &value)) {
 
@@ -208,7 +215,7 @@ bool tajima_open_file(vfs_file_t* file, embroidery_t* api)
             if (count < TAJIMA_COLOR_COUNT_MAX) {
                 color_index[count++] = (uint8_t)value;
             } else {
-                break; // Stop if the file contains more than 15 colors to prevent overflow
+                break; 
             }
         }
     } else {
@@ -220,6 +227,7 @@ bool tajima_open_file(vfs_file_t* file, embroidery_t* api)
     api->name = buf;
     api->get_stitch = get_stitch;
     api->get_thread_color = get_thread_color;
+
 
     vfs_seek(file, 512);
     ok = true;
