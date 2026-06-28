@@ -49,9 +49,6 @@ static const char* TAG = "EMBROIDERY";
 #include "motor_control.h"
 #include <math.h>
 
-#ifndef max
-#define max(a, b) (((a) > (b)) ? (a) : (b))
-#endif
 
 #define STITCH_QUEUE_SIZE 16 // must be a power of 2
 
@@ -156,10 +153,12 @@ static embroidery_job_t job = { 0 };
 
 TaskHandle_t xSDReadTaskHandle = NULL;
 
-// static spindle_ptrs_t* spindle = NULL;
 
-float IRAM_ATTR _abs(float x)
-{
+#ifndef max
+#define max(a, b) (((a) > (b)) ? (a) : (b))
+#endif
+
+static inline float __attribute__((always_inline)) _abs(float x){
     return x < 0 ? -x : x;
 }
 
@@ -264,8 +263,27 @@ float IRAM_ATTR calculate_spindle_rpm_max(float dx, float dy, float feed_max_mms
     return rpm;
 }
 
-static bool IRAM_ATTR spindle_control(float rpm)
+void report_rpm(){
+    #if USE_LINEAR_MOTOR_AS_SPINDLE
+        linear_motor_report_rpm();
+    #else
+        reportRPM();
+    #endif
+}
+
+int16_t get_rpm(){
+      #if USE_LINEAR_MOTOR_AS_SPINDLE
+        return linear_motor_get_rpm();
+    #else
+        return getRPM(); // motor control
+    #endif
+}
+
+
+static bool  spindle_control(float rpm)
 {
+ 
+    // printf("spindle_control()\n");
     bool on = rpm > .001f;
     job.spindle.on = on;
 
@@ -275,6 +293,7 @@ static bool IRAM_ATTR spindle_control(float rpm)
                 linear_motor_set_rpm_ramp((int16_t)rpm, (int16_t)embroidery.rpm_ramp_up);
 
         #elif defined(MOTOR_CONTROL_ENABLE)
+                // hal.stream.write("spindle_control()\n");
                 set_adrc_spindle_speed_ramp((float)rpm, (float)embroidery.rpm_ramp_up);
 
         #else
@@ -287,9 +306,12 @@ static bool IRAM_ATTR spindle_control(float rpm)
     return on;
 }
 
-static int32_t IRAM_ATTR sdcard_read(void)
+static int32_t sdcard_read(void)
 {
 
+    // printf("sd_read()\n");
+
+    // hal.stream.write("sdcard read()\n");
     // Guard 1: If job is already enqueued, nothing to process right now
     if (job.enqueued) {
         return SERIAL_NO_DATA;
@@ -304,6 +326,10 @@ static int32_t IRAM_ATTR sdcard_read(void)
 
     // Guard 3: Attempt to fetch the next stitch from the API.
     // If it fails (file end or read error), flag it, report it, and drop out.
+    if(job.file == NULL){
+        printf("Cannot read-- file is null!!! Attention!!!");
+    }
+
     job.enqueued = !api.get_stitch(&job.queue.stitch[job.queue.head], job.file);
     if (job.enqueued) {
 
@@ -361,62 +387,40 @@ static int32_t IRAM_ATTR sdcard_read(void)
     return SERIAL_NO_DATA;
 }
 
-
-
-/**
- * @brief FreeRTOS task that schedules and executes the SD read loop every 3ms.
- */
-void IRAM_ATTR vEmbroiderySDReaderTask(void* pvParameters)
+// Force clean termination of the file scanning thread upon any master reset sequence
+static void  embroidery_abort_job(void)
 {
-    TickType_t xLastWakeTime = xTaskGetTickCount();
 
-    const TickType_t xFrequency = pdMS_TO_TICKS(30);
+    printf("EMB ABORT!!\n");
 
-    while (1) {
-        if (job.file && !job.enqueued && !job.completed) {
-            sdcard_read();
-        }
 
-        vTaskDelayUntil(&xLastWakeTime, xFrequency);
-    }
-}
+    // Close and release the tracking state flags instantly
+    job.started = false;
+    job.stitching = false;
 
-/**
- * @brief Spawns the background reader task. Call this inside your initialization logic.
- */
-void start_embroidery_task(void)
-{
-    // Prevent duplicate task creation if it's already running
-    if (xSDReadTaskHandle != NULL) {
-        return;
-    }
-
-    xTaskCreatePinnedToCore(
-        vEmbroiderySDReaderTask, // Function pointer to the task loop above
-        "EmbSDReader", // Debugging name seen in monitoring tools
-        4096, // Stack depth in words (SD card operations need plenty of stack space)
-        NULL, // No input parameters passed
-        3, // Priority level (Priority 3 safely coexists with the Web Server)
-        &xSDReadTaskHandle, // Store the handle reference
-        1 // CRITICAL: Pin to Core 0 (Keeps Core 1 100% free for motor step generation)
-    );
-}
-
-/**
- * @brief Safely stops and kills the task when a job finishes or aborts.
- */
-void stop_embroidery_task(void)
-{
+    // 1. Terminate the background SD Card file pointer processing thread safely
     if (xSDReadTaskHandle != NULL) {
         vTaskDelete(xSDReadTaskHandle);
         xSDReadTaskHandle = NULL;
     }
+
+    // 2. Safely close physical files if they are trapped open in memory tables
+    if (job.file != NULL) {
+        // Assuming standard grblHAL vfs wrappers
+        vfs_close(job.file);
+        job.file = NULL;
+    }
+
+    // 3. Immediately pull your custom linear motor voltage back to safe levels
+    spindle_control(0);
 }
 
 static void end_job(void)
 {
+
+    // printf("end_job()\n");
+
     spindle_control(0);
-    // stop_embroidery_task();
 
     job.completed = job.enqueued = true;
 
@@ -425,6 +429,7 @@ static void end_job(void)
         active_stream.type = StreamType_Null;
     }
 
+    
     if (job.file) {
         vfs_close(job.file);
         job.file = NULL;
@@ -492,7 +497,7 @@ static void exec_thread_change(void* data)
 static void thread_trim(void)
 {
     spindle_control(0);
-    report_message("##Thread Trim", Message_Info);
+    report_message("#Thread Trim", Message_Info);
     report_rpm();
 
     protocol_buffer_synchronize(); // Sync and finish all remaining buffered motions before moving on.
@@ -521,10 +526,18 @@ static void exec_hold(void* data)
 static void onStateChanged(sys_state_t state)
 {
 
+    // printf("onStateChange()\n");
+
     static uint32_t last_ms;
 
     if (job.machine_state == state)
         return;
+
+
+    // if (state == STATE_RESET || state == STATE_ALARM) {
+    if (state == STATE_ALARM) {
+        embroidery_abort_job();
+    }    
 
     switch (state) {
 
@@ -570,58 +583,17 @@ static void onStateChanged(sys_state_t state)
     }
 }
 
-// moved inside isr routine.
 
-// static inline void set_needle_trigger(void)
-// {
-//     uint32_t ms = hal.get_elapsed_ticks();
-
-//     if (job.await.trigger /*&& ms - job.last_trigger > 25*/) {
-
-//         job.trigger_interval = ms - job.last_trigger;
-//         job.trigger_interval_min = min(job.trigger_interval_min, job.trigger_interval);
-
-//         if (job.machine_state == STATE_CYCLE) {
-//             job.errs++;
-//             return;
-//         }
-
-//         job.await.trigger = false;
-//     }
-
-//     job.executed.stitches++;
-//     job.last_trigger = ms;
-// }
 
 ISR_CODE void ISR_FUNC(z_limit_trigger)(limit_signals_t state)
 {
-    // if (state.min.z) {
-    //     state.min.z = Off;
-    //     uint32_t ms = hal.get_elapsed_ticks();
 
-    //     if (job.await.trigger /*&& ms - job.last_trigger > 25*/) {
-
-    //         job.trigger_interval = ms - job.last_trigger;
-    //         job.trigger_interval_min = min(job.trigger_interval_min, job.trigger_interval);
-
-    //         if (job.machine_state == STATE_CYCLE) {
-    //             job.errs++;
-    //             return;
-    //         }
-
-    //         job.await.trigger = false;
-    //     }
-
-    //     job.executed.stitches++;
-    //     job.last_trigger = ms;
-    // }
-
-    // if (limit_signals_merge(state).value)
-    //     limits_interrupt_callback(state);
 }
 
 ISR_CODE static void ISR_FUNC(needle_trigger)(uint8_t port, bool state)
 {
+    // printf("ndl()\n"); // this will surely crush the machine
+
     // uint32_t ms = hal.get_elapsed_ticks();
     uint32_t ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
 
@@ -661,7 +633,7 @@ static void onTransferRealTime()
     if (busy) {
 
         if (!bp) {
-            printf("busy\n");
+            // printf("busy\n");
             bp = true;
         }
 
@@ -833,7 +805,9 @@ void emb_spi_slave_read_loop(void* pvParameters)
         resp.mpos[1] = sys.position[Y_AXIS];
         resp.mpos[2] = sys.position[Z_AXIS];
         resp.action_needed = 0;
+        #ifdef LINEAR_MOTOR
         resp.rpm = get_rpm();
+        #endif
 
         req_t req = emb_spi_slave_exchange(&resp);
         resp.flag = req.action;
@@ -947,6 +921,7 @@ void emb_spi_slave_read_loop(void* pvParameters)
 
 static void onExecuteRealtime(sys_state_t state)
 {
+    // printf("onExecRT()\n");
 
     static bool busy = false;
 
@@ -994,6 +969,7 @@ static void onExecuteRealtime(sys_state_t state)
     } else if (job.queue.tail == job.queue.head) {
 
         if (job.file && !job.enqueued && hal.stream.type != StreamType_File) {
+            // printf("set emb file stream\n");
             memcpy(&active_stream, &hal.stream, sizeof(io_stream_t));
             hal.stream.type = StreamType_File; // then redirect to read from SD card instead
             hal.stream.read = sdcard_read;
@@ -1196,6 +1172,7 @@ static status_code_t onFileOpen(const char* fname, vfs_file_t* file, bool stream
                 job.errs = job.exced = 0;
 
                 // start_embroidery_task();
+                // hal.stream.write("ret onfileopen()\n");
             } else {
                 vfs_close(file);
                 report_message("No thread detected", Message_Error);
@@ -1257,11 +1234,12 @@ static status_code_t onFileOpen(const char* fname, vfs_file_t* file, bool stream
     return ok ? Status_OK : (on_file_open ? on_file_open(fname, file, stream) : Status_Unhandled);
 }
 
-static void sdcard_reset(void)
+static void emb_driver_reset(void)
 {
 
+
     report_message("#SD RST", Message_Info);
-    end_job();
+    embroidery_abort_job();
     driver_reset();
 }
 
@@ -1462,6 +1440,7 @@ static void embroidery_settings_restore(void)
 static void embroidery_settings_load(void)
 {
 
+    report_message("#Emb settings load", Message_Info);
     bool ok;
 
     if (hal.nvs.memcpy_from_nvs((uint8_t*)&embroidery, nvs_address, sizeof(embroidery_settings_t), true) != NVS_TransferResult_OK) {
@@ -1588,7 +1567,7 @@ void embroidery_init(void)
         grbl.on_report_options = onReportOptions;
 
         driver_reset = hal.driver_reset;
-        hal.driver_reset = sdcard_reset;
+        hal.driver_reset = emb_driver_reset;
 
         on_file_open = grbl.on_file_open;
         grbl.on_file_open = onFileOpen;
