@@ -94,6 +94,45 @@ static inline int16_t IRAM_ATTR get_y(uint8_t b2, uint8_t b1, uint8_t b0)
     return y;
 }
 
+/**
+
+BYTE 0
+┌───┬───┬───┬───┬───┬───┬───┬───┐
+│ 7 │ 6 │ 5 │ 4 │ 3 │ 2 │ 1 │ 0 │ 
+├───┼───┼───┼───┼───┼───┼───┼───┤
+│Y+1│Y-1│X-1│X+1│Y+9│Y-9│X-9│X+9│  
+└───┴───┴───┴───┴───┴───┴───┴───┘
+
+
+BYTE 1
+┌───┬───┬───┬───┬────┬────┬────┬────┐
+│ 7 │ 6 │ 5 │ 4 │ 3  │ 2  │ 1  │ 0  │  
+├───┼───┼───┼───┼────┼────┼────┼────┤
+│Y+3│Y-3│X-3│X+3│Y+27│Y-27│X-27│X+27│
+└───┴───┴───┴───┴────┴────┴────┴────┘
+
+BYTE 3
+
+       ┌─── CMD ───┐   ┌─── Y ─────┐   ┌──── X ────┐   ┌─── SET ───┐
+Bit:   │ 7   │ 6   │   │ 5   │ 4   │   │ 3   │ 2   │   │ 1   │ 0   │
+       ├─────┼─────┤   ├─────┼─────┤   ├─────┼─────┤   ├─────┼─────┤
+Func:  │CMD 1│CMD 0│   │ Y-81│ Y+81│   │ X-81│ X+81│   │SET 1│SET 0│
+       ├─────┼─────┤   ├─────┼─────┤   ├─────┼─────┤   ├─────┼─────┤
+Mask:  │  1  │  1  │   │  1  │  1  │   │  0  │  0  │   │  1  │  1  │  <- 0b11110011
+       └─────┴─────┘   └─────┴─────┘   └─────┴─────┘   └─────┴─────┘
+
+       command bits
+       b11 stop
+       b10 jump
+       b01 color
+       b00 normal ---> move then penetrate
+
+       set bits 
+       always 11
+ * 
+ */
+
+
 static bool IRAM_ATTR get_stitch(stitch_t* stitch, vfs_file_t* file)
 {
     bool sm = false;
@@ -102,32 +141,36 @@ static bool IRAM_ATTR get_stitch(stitch_t* stitch, vfs_file_t* file)
 
     if (vfs_read(&sd, sizeof(stitch_data_t), 1, file) == sizeof(stitch_data_t)) {
 
-        if ((sd.b2 & 0b11110011) == 0b11110011)
-            return false;
-
-        dx = get_x(sd.b2, sd.b1, sd.b0);
-        dy = get_y(sd.b2, sd.b1, sd.b0);
-
-        if ((sd.b2 & 0b11000011) == 0b11000011)
+        if ((sd.b2 & 0b11110011) == 0b11110011){
             stitch->type = Stitch_Stop;
-        else if ((sd.b2 & 0b01000011) == 0b01000011)
+            stitch->is_last = true;
+            // the last stich 
+        }else{
+            dx = get_x(sd.b2, sd.b1, sd.b0);
+            dy = get_y(sd.b2, sd.b1, sd.b0);
+        }
+
+        if ((sd.b2 & 0b11000011) == 0b11000011){
+            stitch->type = Stitch_Stop;
+
+        }else if ((sd.b2 & 0b01000011) == 0b01000011){
             sm = !sm;
-        else if ((sd.b2 & 0b10000011) == 0b10000011)
+
+        }else if ((sd.b2 & 0b10000011) == 0b10000011){
             stitch->type = sm ? Stitch_SequinEject : Stitch_Jump;
-        else
+
+        }else{
             stitch->type = Stitch_Normal;
+        }
 
         stitch->target.x = (float)dx / 10.0f;
         stitch->target.y = (float)dy / 10.0f;
 
         long position = ((vfs_t *)(file->fs))->ftell(file);
         
-        // char buf[40];
-        // snprintf(buf, sizeof(buf), "position: %lu\n", (unsigned long)position); //
-        // hal.stream.write_all(buf);
-        stitch->stich_number = (int32_t)((position - 512) / 3);
+        stitch->number = (int32_t)((position - 512) / 3);
 
-        stitch->is_last = file->size < position + 2;
+        stitch->is_last = (file->size - position) < 3;
 
     } else {
         return false;
@@ -190,7 +233,7 @@ bool tajima_open_file(vfs_file_t* file, embroidery_t* api)
         if (read_float(meta, &idx, &value)) {
 
             if (!strncmp(meta, "ST:", 3))
-                api->stitches = value;
+                api->stitches = value - 1; // program end command is ignored in get_stich ; alter the behaviour if necessary
             else if (!strncmp(meta, "CO:", 3))
                 api->color_changes = value;
             else if (!strncmp(meta, "+X:", 3))

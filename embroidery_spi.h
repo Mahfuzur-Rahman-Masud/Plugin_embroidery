@@ -11,20 +11,20 @@ typedef enum {
     NONE,
     EMB_SPI_OK,
     SLAVE_OK,
-    POLL,
-    START,
+    POLL, // 3
+    START, // 4
     PAUSE,
     RESUME,
     ABORT,
     FORWARD,
     BACKWARD,
     PEL,
-    MC_LINE,
+    MC_LINE, //11
     SYNC,
     BUF_CLEAR,
     RESET,
     RPM,
-    STITCH,
+    STITCH, // 16
 } action_t;
 
 typedef enum {
@@ -37,9 +37,10 @@ typedef enum {
 typedef union {
     uint8_t data[84];
     struct {
+        uint8_t id;
         action_t action;
         stich_type_t type;
-        int32_t stich_number;
+        int32_t stitch_number;
         embroidery_thread_color_t color;
         float coord[3];
         uint32_t feed;
@@ -53,9 +54,10 @@ typedef union {
 typedef union {
     uint8_t data[84];
     struct {
-        uint8_t flag;
-        uint32_t stich_number;
-        uint8_t stich_status;
+        uint8_t id;
+        uint8_t action;
+        uint32_t stitch_loaded;
+        uint32_t stitch_done;
         float mpos[3];
         float wpos[3];
         uint32_t feed;
@@ -72,10 +74,10 @@ typedef union {
 } resp_t;
 
 #define EMB_SPI_HOST SPI3_HOST
-#define EMB_MOSI GPIO_NUM_17
-#define EMB_MISO GPIO_NUM_3
-#define EMB_SCK GPIO_NUM_19
-#define EMB_CS GPIO_NUM_14
+#define EMB_MOSI GPIO_NUM_4
+#define EMB_MISO GPIO_NUM_5
+#define EMB_SCK GPIO_NUM_6
+#define EMB_CS GPIO_NUM_7
 
 #define EMB_SLAVE_SPI_HOST SPI3_HOST
 #define EMB_SLAVE_MOSI GPIO_NUM_17

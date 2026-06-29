@@ -31,9 +31,13 @@ typedef enum {
     Complex_Machine
 }emb_machine_mode_t;
 
-static emb_machine_mode_t emb_machine_mode = Complex_Machine;
-// static emb_machine_mode_t emb_machine_mode = Web_Front;
-// static emb_machine_mode_t emb_machine_mode = Core_Back;
+#ifdef MACHINE_CORE 
+    static emb_machine_mode_t emb_machine_mode = Core_Back;
+#elif defined(MACHINE_FRONT)
+    static emb_machine_mode_t emb_machine_mode = Web_Front;
+#else
+    static emb_machine_mode_t emb_machine_mode = Complex_Machine;
+#endif    
 
 typedef enum {
     Stitch_Normal,
@@ -133,7 +137,7 @@ typedef struct {
     stich_type_t type;
     embroidery_thread_color_t color;
     coord_data_t target;
-    int32_t stich_number;
+    int32_t number;
     bool is_last;
     float rpm;
 } stitch_t;

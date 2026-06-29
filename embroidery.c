@@ -50,7 +50,14 @@ static const char* TAG = "EMBROIDERY";
 #include <math.h>
 
 
-#define STITCH_QUEUE_SIZE 16 // must be a power of 2
+#ifdef MACHINE_FRONT
+    
+    #define STITCH_QUEUE_SIZE 32  // must be a power of 2
+
+#else 
+    #define STITCH_QUEUE_SIZE 16 // must be a power of 2
+
+#endif    
 
 extern bool brother_open_file(vfs_file_t* file, embroidery_t* api);
 extern bool tajima_open_file(vfs_file_t* file, embroidery_t* api);
@@ -134,6 +141,8 @@ typedef struct
     coord_data_t position;
     embroidery_thread_color_t color;
     stitch_queue_t queue;
+    uint32_t stitch_loaded;
+    uint32_t stitch_done;
 } embroidery_job_t;
 
 static uint8_t port, break_port, jump_port, debug_port;
@@ -216,7 +225,7 @@ float IRAM_ATTR calculate_move_time(float dx, float dy, float f, float a)
     return t * 1000;
 }
 
-// If current RPM is low then reduce all other stich RPM in the queue to prepare the machine for a stop
+// If current RPM is low then reduce all other stitch RPM in the queue to prepare the machine for a stop
 static void IRAM_ATTR ramp_rpm(uint_fast8_t head)
 {
     uint_fast8_t current_idx = head;
@@ -275,7 +284,7 @@ int16_t get_rpm(){
       #if USE_LINEAR_MOTOR_AS_SPINDLE
         return linear_motor_get_rpm();
     #else
-        return getRPM(); // motor control
+        return (int16_t) getRPM(); // motor control
     #endif
 }
 
@@ -334,12 +343,13 @@ static int32_t sdcard_read(void)
     if (job.enqueued) {
 
         // ensure previous stitch is slowed down to get to a full halt
-        // may be this is not necessary as normally the last stich is expected to be a jump or a stop
+        // may be this is not necessary as normally the last stitch is expected to be a jump or a stop
         uint_fast8_t prev_idx = (job.queue.head - 1) & (STITCH_QUEUE_SIZE - 1);
         if (prev_idx == job.queue.tail) {
             return SERIAL_NO_DATA;
         }
 
+        job.queue.stitch[prev_idx].is_last = true;
         job.queue.stitch[prev_idx].rpm = min(job.queue.stitch[prev_idx].rpm, embroidery.rpm_ramp_down);
         ramp_rpm(prev_idx);
         return SERIAL_NO_DATA;
@@ -349,40 +359,50 @@ static int32_t sdcard_read(void)
     // CORE EXECUTION PIPELINE
     // -------------------------------------------------------------------------
     stitch_t stitch = job.queue.stitch[job.queue.head];
-    float rpm = calculate_spindle_rpm_max(stitch.target.x, stitch.target.y, feed, accel);
+    float rpm = 0.0f;
 
     // Track statistics and handle raw RPM baselines
     switch (stitch.type) {
     case Stitch_Normal:
+        rpm = calculate_spindle_rpm_max(stitch.target.x, stitch.target.y, feed, accel);
         job.programmed.stitches++;
         break;
 
     case Stitch_Jump:
-        rpm = 0.0f;
         job.programmed.jumps++;
         break;
 
     case Stitch_Trim:
-        rpm = 0.0f;
         job.programmed.trims++;
         break;
 
     case Stitch_Stop:
-        rpm = 0.0f;
         job.programmed.thread_changes++;
         break;
 
     case Stitch_SequinEject:
+        rpm = calculate_spindle_rpm_max(stitch.target.x, stitch.target.y, feed, accel);
         rpm = rpm / 2.0f;
         job.programmed.sequin_ejects++;
         break;
     }
 
+
+    
+    if(stitch.is_last){
+        rpm = 0;
+    }
+
     // set rpm and set any ramp for previous stitches
     job.queue.stitch[job.queue.head].rpm = rpm;
     ramp_rpm(job.queue.head);
-
     job.queue.head = bptr;
+
+    #ifndef MACHINE_FRONT
+        job.stitch_loaded = stitch.number;
+    #endif
+
+    // job.stitch_loaded
 
     return SERIAL_NO_DATA;
 }
@@ -424,6 +444,7 @@ static void end_job(void)
 
     job.completed = job.enqueued = true;
 
+
     if (active_stream.type != StreamType_Null) {
         memcpy(&hal.stream, &active_stream, sizeof(io_stream_t));
         active_stream.type = StreamType_Null;
@@ -436,28 +457,30 @@ static void end_job(void)
     }
 
     char log_buffer[64];
-    report_message("Job completed!", Message_Info);
-    report_message("----------------------------------------", Message_Info);
-    snprintf(log_buffer, sizeof(log_buffer), "EMB Done: N:%d J:%d T:%d C:%d S:%d",
-        (int)job.executed.stitches,
-        (int)job.executed.jumps,
-        (int)job.executed.trims,
-        (int)job.executed.thread_changes,
-        (int)job.executed.sequin_ejects);
-
-    report_message(log_buffer, Message_Info);
-
-    snprintf(log_buffer, sizeof(log_buffer), "ST        Interval: %d", job.stitch_interval);
-    report_message(log_buffer, Message_Info);
-
-    snprintf(log_buffer, sizeof(log_buffer), "TRIG      Interval: %d", job.trigger_interval);
-    report_message(log_buffer, Message_Info);
-
-    snprintf(log_buffer, sizeof(log_buffer), "TRIG MIN  Interval: %d", job.trigger_interval_min);
-    report_message(log_buffer, Message_Info);
-
-    snprintf(log_buffer, sizeof(log_buffer), "Errors            : %d", job.errs);
-    report_message(log_buffer, Message_Info);
+    printf("\nJob completed!: %s\n", api.name);
+    printf("----------------------------------------\n");
+    printf("Stitches: %d\n", api.stitches);
+    snprintf(log_buffer, sizeof(log_buffer), "EMB Done: N:%d  J:%d T:%d C:%d S:%d\n",
+    (int)job.executed.stitches,
+    (int)job.executed.jumps,
+    (int)job.executed.trims,
+    (int)job.executed.thread_changes,
+    (int)job.executed.sequin_ejects);
+    
+    printf(log_buffer);
+    
+    snprintf(log_buffer, sizeof(log_buffer), "ST        Interval: %d\n", job.stitch_interval);
+    printf(log_buffer);
+    
+    snprintf(log_buffer, sizeof(log_buffer), "TRIG      Interval: %d\n", job.trigger_interval);
+    printf(log_buffer);
+    
+    snprintf(log_buffer, sizeof(log_buffer), "TRIG MIN  Interval: %d\n", job.trigger_interval_min);
+    printf(log_buffer);
+    
+    snprintf(log_buffer, sizeof(log_buffer), "Errors            : %d\n", job.errs);
+    printf(log_buffer);
+    printf("----------------------------------------\n\n");
 }
 
 // Start a tool change sequence. Called by gcode.c on a M6 command (via HAL).
@@ -626,88 +649,128 @@ ISR_CODE static void ISR_FUNC(thread_break)(uint8_t port, bool state)
     }
 }
 
-static void onTransferRealTime()
-{
+static void onTransferRealTime(){
     static bool busy = false;
-    static bool bp = false;
+    static bool was_busy = false;
     if (busy) {
-
-        if (!bp) {
-            // printf("busy\n");
-            bp = true;
+        if (!was_busy) {
+            // printf(".");
+            was_busy = true;
         }
 
         return;
     }
 
     busy = true;
-    bp = false;
+    was_busy = false;
 
-    if (job.queue.tail == job.queue.head) {
-        if (job.enqueued) {
+
+
+    bool empty_q = job.queue.tail == job.queue.head || job.completed;
+
+    if (empty_q) {
+        if (job.enqueued && !job.completed) {
             end_job();
         }
     }
 
-    bool noQ = job.queue.tail == job.queue.head || job.completed;
 
-    static uint32_t stich_number = 1;
-    static uint32_t lstn = 0;
-    static uint8_t slave_buf = 5;
+    static uint8_t tx_free = 5;
+    static req_t req = { .id = 1 };
+    static action_t pending_action = NONE;
+    static action_t x_action = NONE;
 
-    req_t req = { 0 };
+    stitch_t* stitch = &job.queue.stitch[job.queue.tail];
 
-    if (!job.started) {
-        stich_number = 1;
+    if(pending_action == NONE){
+
+
+        if(!job.file){
+            req.action = POLL;
+
+        }else if(job.file && !job.started){
+            req.action = START;
+            req.stitch_number = api.stitches;
+
+        }else if(empty_q 
+            || tx_free < 1  
+            || job.completed 
+            || stitch->number < 1
+            || stitch->number != job.stitch_loaded + 1
+        ){
+            req.action = POLL;
+        }else {
+            req.action = STITCH;
+        }
+
+
+        if(req.action == STITCH){
+            req.stitch_number = stitch->number;
+            req.type = stitch->type;
+            req.color = stitch->color;
+            req.coord[0] = stitch->target.x;
+            req.coord[1] = stitch->target.y;
+            req.rpm = stitch->rpm;
+            req.feed = 10000;  //@Todo
+            req.wait_trigger = stitch->type == Stitch_Normal || stitch->type == Stitch_SequinEject;
+            req.last_stitch = stitch->is_last;
+        }
+
+  
+        pending_action = req.action;
+
+        if(x_action != POLL && pending_action != POLL){
+            req.id++;
+
+            printf("SPI: %s %u %d\n",
+                (req.action == STITCH       ? "STITCH" 
+                    : req.action == POLL    ? "POLL  "
+                    : req.action == START   ? "START "
+                                            : "ACT   "),
+                req.id,                            
+                req.stitch_number);
+        }
     }
 
-    if (noQ || slave_buf < 3) {
-        req.action = POLL;
 
-    } else if (job.queue.stitch[job.queue.tail].stich_number > stich_number) {
-        req.action = POLL;
-        job.queue.tail = --job.queue.tail & (STITCH_QUEUE_SIZE - 1);
-        printf("<< (%d / %d)\n", job.queue.stitch[job.queue.tail].stich_number, stich_number);
 
-    } else if (job.file && !job.started) {
-
-        req.action = START;
-        stich_number = 1;
-        job.started = true;
-
-    } else {
-
-        stitch_t* stitch = &job.queue.stitch[job.queue.tail];
-        // stich_number = stitch->stich_number;
-
-        req.action = STITCH;
-        req.stich_number = stitch->stich_number;
-        req.type = stitch->type;
-        req.color = stitch->color;
-        req.coord[0] = stitch->target.x;
-        req.coord[1] = stitch->target.y;
-        req.rpm = stitch->rpm;
-        req.feed = 4000;
-        req.wait_trigger = stitch->type == Stitch_Normal || stitch->type == Stitch_SequinEject;
-
-        // char log_buffer[64];
-        // snprintf(log_buffer, sizeof(log_buffer), "Master Exch: %d", req.stich_number);
-        // report_message(log_buffer, Message_Info);
-    }
-
-    if (req.action != POLL) {
-        // printf("load %s %d\n",
-        //     req.action == STITCH ? "ST" : req.action == POLL ? "PL"
-        //         : req.action == START                        ? "START"
-        //                                                      : "??",
-        //     req.stich_number);
+    if(req.last_stitch){
+        // printf("sending last stitch %d\n", req.stitch_number);
     }
 
     resp_t resp = emb_spi_master_exchange(&req);
     if (resp.status == SLAVE_OK) {
-        slave_buf = resp.rx_free;
+        tx_free = resp.rx_free;
+        job.stitch_loaded = resp.stitch_loaded == 0 ? job.stitch_loaded : resp.stitch_loaded;
+        job.stitch_done = resp.stitch_done == 0 ? job.stitch_done : resp.stitch_done;
 
-        switch (resp.flag) {
+        if(job.stitch_loaded == stitch->number){
+           job.queue.tail = (++job.queue.tail) & (STITCH_QUEUE_SIZE - 1);
+           job.exced++;
+
+            if(stitch->type == Stitch_Jump){
+                job.programmed.jumps++;
+            }else if (stitch->type == Stitch_Normal){
+                job.programmed.stitches++;
+            }else if (stitch->type == Stitch_SequinEject){
+                job.programmed.sequin_ejects++;
+            }else if (stitch->type == Stitch_Trim){
+                job.programmed.trims++;
+            }else {
+                job.programmed.stitches ++;
+            }
+
+            if(stitch->is_last){
+                printf("Last stitch sent!\n");
+            }
+        }
+
+        if(resp.id == req.id){
+            x_action = pending_action;
+            pending_action = NONE;
+        }
+
+        switch (resp.action) {
         case START:
             printf("Job started\n");
             job.started = true;
@@ -718,81 +781,21 @@ static void onTransferRealTime()
         }
 
     } else {
-        slave_buf = slave_buf - 1;
+        tx_free = tx_free - 1;
     }
 
-    if (resp.stich_number > 0) {
-        if (resp.stich_status == STATUS_ACK) {
-            printf("ACK :(%d) %d / %d\n", req.action == STITCH ? req.stich_number : 0, resp.stich_number, stich_number);
 
-            if (resp.stich_number >= stich_number) {
-                job.queue.tail = (++job.queue.tail) & (STITCH_QUEUE_SIZE - 1);
-                stich_number++;
-            }
-
-        } else if (resp.stich_status == STATUS_NACK) {
-            printf("NACK:(%d) %d / %d\n", req.action == STITCH ? req.stich_number : 0, resp.stich_number, stich_number);
-            // stich_number = resp.stich_number;
-        }
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(10));
+    vTaskDelay(pdMS_TO_TICKS(5));
     busy = false;
-}
-
-static int32_t spi_slave_read(void)
-{
-    if (job.enqueued) {
-        return SERIAL_NO_DATA;
-    }
-
-    uint_fast8_t bptr = (job.queue.head + 1) & (STITCH_QUEUE_SIZE - 1);
-    if (bptr == job.queue.tail) {
-        return SERIAL_NO_DATA;
-    }
-
-    if (job.enqueued) {
-        return SERIAL_NO_DATA;
-    }
-
-    resp_t resp = {
-        .rx_free = (job.queue.tail - job.queue.head - 1 + STITCH_QUEUE_SIZE) % STITCH_QUEUE_SIZE,
-        .flag = SLAVE_OK,
-        .status = SLAVE_OK,
-        .state = job.machine_state,
-        .mpos[0] = sys.position[X_AXIS],
-        .mpos[1] = sys.position[Y_AXIS],
-        .mpos[2] = sys.position[Z_AXIS],
-    };
-
-    req_t req = emb_spi_slave_exchange(&resp);
-    if (req.action == STITCH) {
-        stitch_t stitch = {
-            .type = req.type,
-            .color = req.color,
-            .target.x = req.coord[0],
-            .target.y = req.coord[1],
-            .target.z = req.coord[2],
-            .rpm = req.rpm,
-            .stich_number = req.stich_number
-        };
-
-        job.enqueued = req.last_stitch;
-        job.queue.stitch[job.queue.head] = stitch;
-        ++job.queue.head;
-    }
-
-    return SERIAL_NO_DATA;
 }
 
 void emb_spi_slave_read_loop(void* pvParameters)
 {
 
-    static resp_t resp = { .stich_number = 0, .stich_status = STATUS_IDLE };
-    static int32_t next_stich = 1;
-    static action_t last_processed_action = NONE;
+    static resp_t resp = { .stitch_loaded = 0, .stitch_done = 0 };
+    static uint8_t last_request;
 
-    resp.flag = SLAVE_OK;
+    resp.action = SLAVE_OK;
     resp.status = SLAVE_OK;
 
     while (1) {
@@ -805,59 +808,65 @@ void emb_spi_slave_read_loop(void* pvParameters)
         resp.mpos[1] = sys.position[Y_AXIS];
         resp.mpos[2] = sys.position[Z_AXIS];
         resp.action_needed = 0;
-        #ifdef LINEAR_MOTOR
         resp.rpm = get_rpm();
-        #endif
+        resp.stitch_done = job.stitch_done;
 
         req_t req = emb_spi_slave_exchange(&resp);
-        resp.flag = req.action;
 
-        if (req.action != last_processed_action) {
+        resp.action = req.action;
+        resp.id = req.id;
+
+        if (req.id != last_request) {
+                // printf("SPI R: %s %u %d\t | %u\n",
+                // (req.action == STITCH       ? "STITCH" 
+                //     : req.action == POLL    ? "POLL  "
+                //     : req.action == START   ? "START "
+                //                             : "ACT   "),
+                // req.id,                            
+                // req.stitch_number, resp.rx_free);
 
             switch (req.action) {
             case PAUSE:
                 grbl.enqueue_realtime_command('!');
-
                 resp.status = SLAVE_OK;
                 break;
+
             case RESUME:
                 grbl.enqueue_realtime_command('~');
                 resp.status = SLAVE_OK;
                 break;
 
             case ABORT:
-                next_stich = 1;
-                // job.queue.head = job.queue.tail;
                 grbl.enqueue_realtime_command(0x18);
-
                 resp.status = SLAVE_OK;
                 break;
-            case START: {
-                // memcpy(&active_stream, &hal.stream, sizeof(io_stream_t)); // Save current stream pointers
-                // hal.stream.type = StreamType_File; // then redirect to read from SD card instead
-                // hal.stream.read = sdcard_read;
 
+            case MC_LINE:
+                break;
+
+            case START: {
                 plan_data_init(&job.plan_data);
 
                 // job.file = file;
-                job.completed = job.enqueued = job.stitching = false;
+                job.started = job.completed = job.enqueued = job.stitching = false;
                 job.queue.head = job.queue.tail = job.stitch_interval = job.trigger_interval = job.await.value = job.breaks = 0;
                 job.plan_data.feed_rate = embroidery.feedrate;
                 job.plan_data.condition.rapid_motion = On;
-
-                // if (embroidery.sync_mode){
-                //     job.plan_data.spindle.hal->get_data = spindleGetData;
-                // }
-
                 job.plan_data.spindle.hal->cap.at_speed = On,
+
                 system_convert_array_steps_to_mpos(job.position.values, sys.position);
 
                 memset(&job.programmed, 0, sizeof(embroidery_job_details_t));
                 memset(&job.executed, 0, sizeof(embroidery_job_details_t));
 
                 job.trigger_interval_min = 10000;
+                job.stitch_interval = 0;
+                job.trigger_interval = 0;
                 job.errs = job.exced = 0;
+                job.stitch_done = 0;
+                job.stitch_loaded = 0;
                 resp.status = SLAVE_OK;
+                api.stitches = req.stitch_number;
                 printf("Job started\n");
             }
 
@@ -867,54 +876,49 @@ void emb_spi_slave_read_loop(void* pvParameters)
                 resp.status = SLAVE_OK;
                 break;
             }
+
+            last_request = req.id;
         }
 
-        last_processed_action = req.action;
 
         if (req.action != STITCH) {
-            // take action
             vTaskDelay(pdMS_TO_TICKS(5));
             continue;
         }
 
-        if (req.action == STITCH) {
-            stitch_t stitch = {
-                .type = req.type,
-                .color = req.color,
-                .target.x = req.coord[0],
-                .target.y = req.coord[1],
-                .target.z = req.coord[2],
-                .rpm = req.rpm,
-                .stich_number = req.stich_number
-            };
+        
+        stitch_t stitch = {
+            .type = req.type,
+            .color = req.color,
 
-            // Guard 2: If the buffer is completely full, drop out early
-            // if (bptr == job.queue.tail) {
-            //     return SERIAL_NO_DATA;
-            // }
+            .target.x = req.coord[0],
+            .target.y = req.coord[1],
+            .target.z = req.coord[2],
+            .rpm = req.rpm,
+            .number = req.stitch_number,
+            .is_last = req.last_stitch
+        };
 
-            if (rx_free > 0 && bptr != job.queue.tail && req.stich_number == next_stich) {
-                resp.stich_number = req.stich_number;
-                resp.stich_status = STATUS_ACK;
+        // Guard 2: If the buffer is completely full, drop out early
+        // if (bptr == job.queue.tail) {
+        //     return SERIAL_NO_DATA;
+        // }
 
-                job.enqueued = req.last_stitch;
-                job.queue.stitch[job.queue.head] = stitch;
-                job.queue.head = bptr;
-                printf("ACK  | Stich Num: %ld / %ld\n", (long)req.stich_number, (long)next_stich);
-                next_stich = req.stich_number + 1;
-
-            } else if (req.stich_number < next_stich) {
-                printf("ACK  | Stich Num: %ld / %ld\n", (long)req.stich_number, (long)next_stich);
-                resp.stich_number = req.stich_number;
-                resp.stich_status = STATUS_ACK;
-
-            } else {
-                printf("NACK | Stich Num: %ld / %ld\n", (long)req.stich_number, (long)next_stich);
-                resp.stich_number = next_stich;
-                resp.stich_status = STATUS_NACK;
+        if (rx_free > 0 && bptr != job.queue.tail && req.stitch_number != job.stitch_loaded) {
+            resp.stitch_loaded = req.stitch_number;
+            job.queue.stitch[job.queue.head] = stitch;
+            job.stitch_loaded = resp.stitch_loaded;
+            
+            if(stitch.is_last){
+                job.enqueued = true;
+                ramp_rpm(job.queue.head);
+                printf("last stitch loaded!\n");
             }
-        }
-
+            
+            job.queue.head = bptr;
+            // printf("Stitch loaded: %ld\n", (long)req.stitch_number);
+        } 
+    
         vTaskDelay(pdMS_TO_TICKS(5));
     }
 }
@@ -955,7 +959,7 @@ static void onExecuteRealtime(sys_state_t state)
         return;
     }
 
-    if (job.enqueued && job.queue.tail == job.queue.head) {
+    if (job.enqueued && job.queue.tail == job.queue.head && !job.completed) {
 
         end_job();
         hal.stream.cancel_read_buffer();
@@ -1033,6 +1037,8 @@ static void onExecuteRealtime(sys_state_t state)
             job.position.z = embroidery.z_travel;
             mc_line(job.position.values, &job.plan_data);
         }
+
+        
         break;
 
     case Stitch_Jump:
@@ -1067,7 +1073,6 @@ static void onExecuteRealtime(sys_state_t state)
         job.plan_data.feed_rate = embroidery.jump_feed_rate;
         mc_line(job.position.values, &job.plan_data);
         job.plan_data.feed_rate = f;
-
         task_add_immediate(exec_thread_trim, NULL);
         break;
 
@@ -1075,7 +1080,7 @@ static void onExecuteRealtime(sys_state_t state)
         hal.stream.write_all("#STS\n");
         report_rpm();
         spindle_control(0);
-        job.await.pause = true;
+        job.await.pause = !stitch->is_last;
         job.plan_data.condition.rapid_motion = On;
 
         job.position.x += stitch->target.x;
@@ -1087,7 +1092,11 @@ static void onExecuteRealtime(sys_state_t state)
         job.plan_data.feed_rate = f;
 
         job.color = stitch->color;
-        task_add_immediate(exec_thread_change, NULL);
+        
+        if(!stitch->is_last){
+            task_add_immediate(exec_thread_change, NULL);
+        }
+
         job.spindle_stop = embroidery.stop_delay;
         break;
 
@@ -1110,8 +1119,12 @@ static void onExecuteRealtime(sys_state_t state)
             job.position.z = embroidery.z_travel;
             mc_line(job.position.values, &job.plan_data);
         }
+
         break;
     }
+
+    job.stitch_done = stitch->number;
+    // printf("stitch: [%d/%d] / %d\n", job.stitch_done, job.stitch_loaded, api.stitches);
 
     busy = false;
 }
@@ -1170,9 +1183,13 @@ static status_code_t onFileOpen(const char* fname, vfs_file_t* file, bool stream
 
                 job.trigger_interval_min = 10000;
                 job.errs = job.exced = 0;
+                job.stitch_done = 0;
+                job.stitch_loaded = 0;
+                job.started = false;
 
                 // start_embroidery_task();
-                // hal.stream.write("ret onfileopen()\n");
+                hal.stream.write("ret onfileopen()\n");
+            
             } else {
                 vfs_close(file);
                 report_message("No thread detected", Message_Error);
