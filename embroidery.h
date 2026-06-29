@@ -163,7 +163,7 @@ typedef struct {
 } embroidery_t;
 
 typedef bool (*open_file_ptr)(vfs_file_t *file, embroidery_t *api);
-
+bool embroidery_back();
 const char *embroidery_get_thread_color (embroidery_thread_color_t color);
 void embroidery_set_thread_trim_handler (thread_trim_ptr handler);
 void embroidery_set_thread_change_handler (thread_change_ptr handler);

@@ -133,7 +133,9 @@ Mask:  │  1  │  1  │   │  1  │  1  │   │  0  │  0  │   │  1 
  */
 
 
-static bool IRAM_ATTR get_stitch(stitch_t* stitch, vfs_file_t* file)
+
+
+static bool get_stitch(stitch_t* stitch, vfs_file_t* file)
 {
     bool sm = false;
     int16_t dx = 0, dy = 0;

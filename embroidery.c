@@ -57,7 +57,8 @@ static const char* TAG = "EMBROIDERY";
 #else 
     #define STITCH_QUEUE_SIZE 16 // must be a power of 2
 
-#endif    
+#endif
+
 
 extern bool brother_open_file(vfs_file_t* file, embroidery_t* api);
 extern bool tajima_open_file(vfs_file_t* file, embroidery_t* api);
@@ -98,6 +99,47 @@ typedef struct
     volatile uint_fast8_t tail;
     stitch_t stitch[STITCH_QUEUE_SIZE];
 } stitch_queue_t;
+
+
+#define ACTION_QUEUE_SIZE 16
+
+typedef struct{
+   uint8_t id; 
+} cmd_t;
+
+typedef struct {
+    volatile uint_fast8_t head;
+    volatile uint_fast8_t tail;
+    cmd_t action[ACTION_QUEUE_SIZE];
+} cmd_queue_t;
+
+static cmd_queue_t cmd_q = {0};
+
+bool cmd_q_peek(cmd_t* cmd){
+    if(cmd_q.tail == cmd_q.head){
+        return false;
+    }
+
+    cmd->id = cmd_q.action[cmd_q.tail].id;
+    return true;
+}
+
+void cmd_q_step(){
+   cmd_q.tail = (++cmd_q.tail) & (ACTION_QUEUE_SIZE - 1);
+}
+
+bool cmd_q_put(cmd_t action){
+
+    uint_fast8_t bptr = (cmd_q.head + 1) & (ACTION_QUEUE_SIZE - 1);
+
+    if (bptr == cmd_q.tail) {
+        return false;
+    }
+
+    cmd_q.action[cmd_q.head] = action;
+    cmd_q.head =  bptr;
+    return true;
+}
 
 typedef struct
 {
@@ -272,6 +314,8 @@ float IRAM_ATTR calculate_spindle_rpm_max(float dx, float dy, float feed_max_mms
     return rpm;
 }
 
+
+
 void report_rpm(){
     #if USE_LINEAR_MOTOR_AS_SPINDLE
         linear_motor_report_rpm();
@@ -313,6 +357,11 @@ static bool  spindle_control(float rpm)
     }
 
     return on;
+}
+
+static uint32_t seek(uint32_t position){
+    vfs_seek(job.file, position);
+    return ((vfs_t *)(job.file->fs))->ftell(job.file);
 }
 
 static int32_t sdcard_read(void)
@@ -481,6 +530,76 @@ static void end_job(void)
     snprintf(log_buffer, sizeof(log_buffer), "Errors            : %d\n", job.errs);
     printf(log_buffer);
     printf("----------------------------------------\n\n");
+}
+
+bool embroidery_back(){
+    if(job.machine_state != STATE_HOLD){
+        return false;
+    }
+
+    spindle_control(0);
+
+
+
+    stitch_t* tail_stitch = &job.queue.stitch[job.queue.tail]; // this is not executed yet
+    if(tail_stitch->number <= 0){ // not a real stitch
+        return false;
+    }
+
+
+    uint32_t position = 512 + (tail_stitch->number - 1) * 3; // tajima style should be different for brother
+    if (seek(position) != position){
+        return false;
+    }
+
+    
+    job.queue.head = job.queue.tail; // empty out stitch buffer
+    if(!api.get_stitch(tail_stitch, job.file)){ // get the last executed stitch
+        return false;
+    }
+
+    job.queue.stitch[job.queue.tail] = *tail_stitch; // put the stitch  in queue to allow back possible again
+    job.queue.head = (job.queue.head + 1) & (STITCH_QUEUE_SIZE - 1);
+
+    job.exced--;
+    job.plan_data.condition.rapid_motion = On;
+    job.position.x -= tail_stitch->target.x;
+    job.position.y -= tail_stitch->target.y;
+    job.await.trigger = false;
+    mc_line(job.position.values, &job.plan_data);
+
+    switch (tail_stitch->type){
+    case Stitch_Normal:
+        job.executed.stitches--;
+        break;
+
+    case Stitch_Jump:
+        job.executed.jumps--;
+        break;
+    
+    case Stitch_SequinEject:
+        job.executed.sequin_ejects--;
+        break;        
+
+    case Stitch_Trim:
+        job.executed.trims--;
+        break;
+
+    case Stitch_Stop:
+        job.executed.thread_changes--;
+        job.color = tail_stitch->color;
+        break;    
+
+    default:
+        break;
+    }
+
+    protocol_buffer_synchronize();
+    if(tail_stitch->type == Stitch_Stop && !tail_stitch->is_last){
+        task_add_immediate(exec_thread_change, NULL);
+    }
+
+    return true;
 }
 
 // Start a tool change sequence. Called by gcode.c on a M6 command (via HAL).
@@ -679,13 +798,19 @@ static void onTransferRealTime(){
     static req_t req = { .id = 1 };
     static action_t pending_action = NONE;
     static action_t x_action = NONE;
+    static cmd_t cmd = {0};
+
 
     stitch_t* stitch = &job.queue.stitch[job.queue.tail];
 
     if(pending_action == NONE){
 
+        if(cmd_q_peek(&cmd)){
+            req.req_type = 1;
+            req.action = cmd.id;
+        }
 
-        if(!job.file){
+        else if(!job.file){
             req.action = POLL;
 
         }else if(job.file && !job.started){
@@ -766,6 +891,11 @@ static void onTransferRealTime(){
         }
 
         if(resp.id == req.id){
+            if(req.req_type == 1){
+                cmd_q_step();
+                req.req_type = 0;
+            }
+            
             x_action = pending_action;
             pending_action = NONE;
         }
@@ -1091,9 +1221,9 @@ static void onExecuteRealtime(sys_state_t state)
         mc_line(job.position.values, &job.plan_data);
         job.plan_data.feed_rate = f;
 
-        job.color = stitch->color;
         
         if(!stitch->is_last){
+            job.color = stitch->color;
             task_add_immediate(exec_thread_change, NULL);
         }
 

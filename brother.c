@@ -245,6 +245,7 @@ bool brother_open_file (vfs_file_t *file, embroidery_t *api)
     if(vfs_read(header.buf, sizeof(pes_header_t), 1, file) == sizeof(pes_header_t) && !strncmp(header.version, "#PES", 4)) {
 
         vfs_seek(file, header.pec_offset);
+    
 
         vfs_read(pec_1.buf, sizeof(pec_section1_t), 1, file);
         vfs_read(pec_2.buf, sizeof(pec_section2_t), 1, file);

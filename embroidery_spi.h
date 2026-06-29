@@ -38,7 +38,10 @@ typedef union {
     uint8_t data[84];
     struct {
         uint8_t id;
+        uint8_t req_type;
         action_t action;
+
+        // stich data
         stich_type_t type;
         int32_t stitch_number;
         embroidery_thread_color_t color;
